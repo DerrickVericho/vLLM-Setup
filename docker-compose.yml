@@ -1,0 +1,69 @@
+name: vllm
+
+networks:
+  llm:
+    name: llm
+    driver: bridge
+
+volumes:
+  open_webui: # Open WebUI state (users, chat history)
+
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.27.1
+    container_name: vllm
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    ipc: host
+    volumes:
+      - ${HF_CACHE_DIR:?set HF_CACHE_DIR in .env}:/hf
+    environment:
+      HF_HOME: /hf
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      VLLM_WSL2_ENABLE_PIN_MEMORY: "1"
+    command: >
+      --model ${MODEL_ID:?set MODEL_ID in .env}
+      --served-model-name ${MODEL_ALIAS:-chat}
+      --max-model-len ${MAX_MODEL_LEN:-8192}
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
+      --max-num-seqs ${MAX_NUM_SEQS:-64}
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 1800s # large-model cold start is 10-20 min; shorter = restart loop
+    networks: [llm]
+
+  # Optional. Delete this service and the open_webui volume to run vLLM alone —
+  # nothing in the vllm service references it.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.0 # pinned; :latest and :main are the same dev build
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_started # not service_healthy: don't block the UI for 20 min
+    volumes:
+      - open_webui:/app/backend/data
+    environment:
+      OPENAI_API_BASE_URL: http://vllm:8000/v1
+      OPENAI_API_KEY: ${VLLM_API_KEY}
+      WEBUI_AUTH: "true"
+      ENABLE_OLLAMA_API: "false" # otherwise it polls host.docker.internal:11434 and 500s
+      HF_HUB_OFFLINE: "1" # use the cached embedding model, don't re-download on boot
+    ports:
+      - "${WEBUI_BIND_ADDR:-127.0.0.1}:3000:8080"
+    networks: [llm]
